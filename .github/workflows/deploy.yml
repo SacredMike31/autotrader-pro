@@ -1,4 +1,3 @@
-
 name: Deploy AutoTrader Pro to GitHub Pages
 
 on:
@@ -28,11 +27,10 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: 24
 
       - name: Install dependencies
-        run: npm install
+        run: npm install --no-package-lock
 
       - name: Build
         run: npm run build
