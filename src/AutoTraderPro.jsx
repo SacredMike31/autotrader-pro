@@ -7,21 +7,31 @@ import {
 } from "recharts";
 
 // ─────────────────────────────────────────────
-// SYMBOL UNIVERSE  (US stocks only for Alpaca)
+// SYMBOL UNIVERSE
 // ─────────────────────────────────────────────
 const SYMBOL_UNIVERSE = [
-  { sym:"AAPL",  base:185, sector:"Tech" },
-  { sym:"TSLA",  base:220, sector:"Auto" },
-  { sym:"NVDA",  base:480, sector:"Tech" },
-  { sym:"MSFT",  base:380, sector:"Tech" },
-  { sym:"AMZN",  base:175, sector:"Retail" },
-  { sym:"META",  base:490, sector:"Tech" },
-  { sym:"GOOGL", base:140, sector:"Tech" },
-  { sym:"SPY",   base:450, sector:"ETF" },
-  { sym:"JPM",   base:195, sector:"Finance" },
-  { sym:"AMD",   base:165, sector:"Tech" },
+  { sym:"AAPL",  base:185,  sector:"Tech" },
+  { sym:"TSLA",  base:220,  sector:"Auto" },
+  { sym:"NVDA",  base:480,  sector:"Tech" },
+  { sym:"MSFT",  base:380,  sector:"Tech" },
+  { sym:"AMZN",  base:175,  sector:"Retail" },
+  { sym:"META",  base:490,  sector:"Tech" },
+  { sym:"GOOGL", base:140,  sector:"Tech" },
+  { sym:"SPY",   base:450,  sector:"ETF" },
+  { sym:"JPM",   base:195,  sector:"Finance" },
+  { sym:"AMD",   base:165,  sector:"Tech" },
+  { sym:"TQQQ",  base:65,   sector:"Leveraged" }, // 3× Long Nasdaq
+  { sym:"SQQQ",  base:12,   sector:"Leveraged" }, // 3× Short Nasdaq
 ];
 const DEFAULT_WATCHLIST = ["AAPL","TSLA","NVDA","MSFT","AMZN","SPY"];
+
+// Leveraged ETFs need wider stops due to 3× daily volatility
+const LEVERAGED_SYMS = new Set(["TQQQ","SQQQ"]);
+// SL/TP multipliers for leveraged symbols vs standard settings
+const LEV_SL_MULT   = 2.0;  // e.g. 2% SL → 4% for leveraged
+const LEV_TRAIL_MULT= 1.5;  // e.g. 4% trail → 6% for leveraged
+const LEV_ACTIV_MULT= 1.5;  // e.g. 3% activation → 4.5% for leveraged
+const LEV_SIZE_MULT = 0.5;  // half position size to compensate for wider stops
 const BASE_PX = Object.fromEntries(SYMBOL_UNIVERSE.map(s=>[s.sym,s.base]));
 
 const INIT_CAP  = 10000;
@@ -47,9 +57,9 @@ async function tdFetch(symbols, interval, outputsize, key) {
     apikey: key,
     order: "ASC",
   });
-  let res;
+  let res: Response;
   try {
-    res = await fetch(`https://api.twelvedata.com/time_series?${params}`);
+    res = await fetch(`/api/proxy/twelvedata?${params}`);
   } catch {
     throw new Error("Network error — check your internet connection.");
   }
@@ -207,7 +217,7 @@ function sizePos(capital,price,rp,mult=1){
 // DESIGN TOKENS
 // ─────────────────────────────────────────────
 const T={bg:"#04060f",surface:"#0b0f1e",card:"#0f1629",border:"#1a2035",G:"#00d4aa",R:"#ff4d6d",B:"#4f8fff",P:"#a78bfa",Y:"#fbbf24",O:"#fb923c",GR:"#2a3555",text:"#e2e8f0",muted:"#64748b",dim:"#2a3555"};
-const SECTOR_COL={Tech:T.B,Finance:T.G,Retail:T.Y,Auto:T.P,ETF:"#94a3b8"};
+const SECTOR_COL={Tech:T.B,Finance:T.G,Retail:T.Y,Auto:T.P,ETF:"#94a3b8",Leveraged:T.O};
 
 // ─────────────────────────────────────────────
 // MICRO COMPONENTS
@@ -257,6 +267,9 @@ export default function AutoTraderPro(){
   const [mktStatus,setMktStatus]=useState("");
 
   const [running,setRunning]=useState(persisted?.running ?? false);
+  const [liveOnlyMode,setLiveOnlyMode]=useState(persisted?.liveOnlyMode ?? true); // when true, NEVER fall back to sim
+  const [liveBlocked,setLiveBlocked]=useState(false); // true when live fetch failed and liveOnly is on
+  const [reconnecting,setReconnecting]=useState(persisted?.dataMode==="live");
   const [tab,setTab]=useState("scanner");
   const [selSym,setSelSym]=useState("AAPL");
   const [wlOpen,setWlOpen]=useState(false);
@@ -270,10 +283,11 @@ export default function AutoTraderPro(){
   const connRef=useRef(connected);    useEffect(()=>{connRef.current=connected;},[connected]);
   const keyRef=useRef(apiKey);        useEffect(()=>{keyRef.current=apiKey;},[apiKey]);
   const tfRef=useRef(tf);             useEffect(()=>{tfRef.current=tf;},[tf]);
+  const liveOnlyRef=useRef(liveOnlyMode); useEffect(()=>{liveOnlyRef.current=liveOnlyMode;},[liveOnlyMode]);
   const tickLock=useRef(false);
 
   // ── Connect to Twelve Data ──────────────────
-  async function connectLive(keyOverride, tfOverride, silent){
+  async function connectLive(keyOverride?, tfOverride?, silent?){
     const k=keyOverride||apiKey, useTf=tfOverride||tf;
     if(!k){if(!silent)setConnErr("Please enter your API key.");return false;}
     if(!silent)setConnecting(true);
@@ -288,27 +302,37 @@ export default function AutoTraderPro(){
         if(vals&&vals.length>0){ts.current.symbols[sym].candles=vals.map(tdBar);loaded++;}
       }
       if(loaded===0)throw new Error("No data returned. Check your API key and try again.");
-      setConnected(true);setDataMode("live");setConnErr("");
+      setConnected(true);setDataMode("live");setConnErr("");setLiveBlocked(false);
       setLastRefresh(new Date());setMktStatus("open");
       if(!silent)setTab("scanner");
       bump(n=>n+1);
       return true;
     }catch(err){
       if(!silent)setConnErr(err.message||"Connection failed. Check your key and try again.");
-      else{setConnected(false);setDataMode("sim");}
+      else{
+        // Silent reconnect on mount failed — if liveOnly, freeze don't sim
+        setConnected(false);
+        if(liveOnlyRef.current){setLiveBlocked(true);}
+        else{setDataMode("sim");}
+      }
       return false;
-    }finally{if(!silent)setConnecting(false);}
+    }finally{
+      if(!silent)setConnecting(false);
+      setReconnecting(false);
+    }
   }
 
-  function disconnect(){setConnected(false);setDataMode("sim");setMktStatus("");}
+  function disconnect(){setConnected(false);setDataMode("sim");setMktStatus("");setLiveBlocked(false);setReconnecting(false);}
 
-  // ── On mount: restore connection if we were live before refresh ──
+  // ── On mount: restore live connection, freeze ticks until confirmed ──
   const didInit=useRef(false);
   useEffect(()=>{
     if(didInit.current)return;
     didInit.current=true;
     if(persisted?.dataMode==="live"&&(persisted?.apiKey||DEFAULT_API_KEY)){
       connectLive(persisted.apiKey||DEFAULT_API_KEY,persisted.tf,true);
+    } else {
+      setReconnecting(false);
     }
   },[]);
 
@@ -316,12 +340,12 @@ export default function AutoTraderPro(){
   useEffect(()=>{
     const id=setInterval(()=>{
       savePersisted({
-        ts:ts.current, strat, rp, dataMode, apiKey, tf, running,
+        ts:ts.current, strat, rp, dataMode, apiKey, tf, running, liveOnlyMode,
         lastRefresh:lastRefresh?lastRefresh.toISOString():null,
       });
     },4000);
     return()=>clearInterval(id);
-  },[strat,rp,dataMode,apiKey,tf,running,lastRefresh]);
+  },[strat,rp,dataMode,apiKey,tf,running,liveOnlyMode,lastRefresh]);
 
   // ── Main tick ───────────────────────────────
   const doTick=useCallback(async()=>{
@@ -348,10 +372,23 @@ export default function AutoTraderPro(){
           if(gotNew)setLastRefresh(new Date());
           setMktStatus(gotNew?"open":"closed");
         }catch(err){
-          console.warn("Live fetch failed, using sim:",err.message);
+          console.warn("Live fetch failed:",err.message);
+          if(liveOnlyRef.current){
+            // Live Only mode — freeze completely, do not inject sim candles
+            setLiveBlocked(true);
+            setMktStatus("closed");
+            tickLock.current=false;
+            return;
+          }
+          // Sim fallback only if Live Only is off
           for(const sym of s.watchlist){const sd=s.symbols[sym];const nc=nextCandle(sd.candles[sd.candles.length-1].c,BASE_PX[sym]||150);s.symbols[sym].candles=[...sd.candles.slice(-199),nc];}
         }
       }else{
+        // Sim mode — only run if Live Only is off
+        if(liveOnlyRef.current&&persisted?.dataMode==="live"){
+          tickLock.current=false;
+          return;
+        }
         for(const sym of s.watchlist){const sd=s.symbols[sym];const nc=nextCandle(sd.candles[sd.candles.length-1].c,BASE_PX[sym]||150);s.symbols[sym].candles=[...sd.candles.slice(-199),nc];}
       }
 
@@ -388,8 +425,12 @@ export default function AutoTraderPro(){
         s.open=s.open.map(t=>{
           const px=symData[t.sym]?.px??t.entry;
           const prof=(t.dir==="BUY"?1:-1)*(px-t.entry)/t.entry*100;
-          if(!t.trailingActive&&prof>=r.trailActivation){const lsl=t.dir==="BUY"?+(t.entry*(1+r.lockInPct/100)).toFixed(3):+(t.entry*(1-r.lockInPct/100)).toFixed(3);return{...t,sl:lsl,trailingActive:true,peakPx:px};}
-          if(t.trailingActive){const px2=symData[t.sym]?.px??t.entry,pk=t.dir==="BUY"?Math.max(t.peakPx??t.entry,px2):Math.min(t.peakPx??t.entry,px2),tsl=t.dir==="BUY"?+(pk*(1-r.trailPct/100)).toFixed(3):+(pk*(1+r.trailPct/100)).toFixed(3),better=t.dir==="BUY"?tsl>t.sl:tsl<t.sl;return{...t,sl:better?tsl:t.sl,peakPx:pk};}
+          const isLev=t.isLeveraged||LEVERAGED_SYMS.has(t.sym);
+          const activation=r.trailActivation*(isLev?LEV_ACTIV_MULT:1);
+          const trailPct=r.trailPct*(isLev?LEV_TRAIL_MULT:1);
+          const lockPct=r.lockInPct*(isLev?LEV_SL_MULT:1);
+          if(!t.trailingActive&&prof>=activation){const lsl=t.dir==="BUY"?+(t.entry*(1+lockPct/100)).toFixed(3):+(t.entry*(1-lockPct/100)).toFixed(3);return{...t,sl:lsl,trailingActive:true,peakPx:px};}
+          if(t.trailingActive){const px2=symData[t.sym]?.px??t.entry,pk=t.dir==="BUY"?Math.max(t.peakPx??t.entry,px2):Math.min(t.peakPx??t.entry,px2),tsl=t.dir==="BUY"?+(pk*(1-trailPct/100)).toFixed(3):+(pk*(1+trailPct/100)).toFixed(3),better=t.dir==="BUY"?tsl>t.sl:tsl<t.sl;return{...t,sl:better?tsl:t.sl,peakPx:pk};}
           return t;
         });
       }
@@ -408,12 +449,17 @@ export default function AutoTraderPro(){
           const par=s.open.find(t=>t.sym===sym&&t.dir===sig.dir&&!t.pyramided&&!t.isPyramid);
           if(par){
             const pf=(par.dir==="BUY"?1:-1)*(px-par.entry)/par.entry*100;
-            if(pf>=r.pyramidTrigger){
-              const pySh=sizePos(s.capital,px,r,r.pyramidSize/100),cost=pySh*px;
+            const isLev=LEVERAGED_SYMS.has(sym);
+            const levActiv=isLev?r.pyramidTrigger*LEV_ACTIV_MULT:r.pyramidTrigger;
+            if(pf>=levActiv){
+              const sizeMult=(r.pyramidSize/100)*(isLev?LEV_SIZE_MULT:1);
+              const pySh=sizePos(s.capital,px,r,sizeMult),cost=pySh*px;
               if(pySh>0&&cost<=s.capital){
-                const sl=sig.dir==="BUY"?+(px*(1-r.slPct/100)).toFixed(3):+(px*(1+r.slPct/100)).toFixed(3),tp=sig.dir==="BUY"?+(px*(1+r.slPct/100*r.tpRatio)).toFixed(3):+(px*(1-r.slPct/100*r.tpRatio)).toFixed(3);
+                const slPct=r.slPct*(isLev?LEV_SL_MULT:1);
+                const sl=sig.dir==="BUY"?+(px*(1-slPct/100)).toFixed(3):+(px*(1+slPct/100)).toFixed(3);
+                const tp=sig.dir==="BUY"?+(px*(1+slPct/100*r.tpRatio)).toFixed(3):+(px*(1-slPct/100*r.tpRatio)).toFixed(3);
                 s.capital-=cost;
-                s.open=[...s.open,{id:Date.now()+s.n+sym+"py",sym,dir:sig.dir,entry:+px.toFixed(3),shares:pySh,cost:+cost.toFixed(2),sl,tp,why:"🔺 Pyramid add-on",ot:new Date().toLocaleTimeString(),str:sig.label,isPyramid:true}];
+                s.open=[...s.open,{id:Date.now()+s.n+sym+"py",sym,dir:sig.dir,entry:+px.toFixed(3),shares:pySh,cost:+cost.toFixed(2),sl,tp,why:"🔺 Pyramid add-on",ot:new Date().toLocaleTimeString(),str:sig.label,isPyramid:true,isLeveraged:isLev}];
                 s.open=s.open.map(t=>t.id===par.id?{...t,pyramided:true}:t);
               }
             }
@@ -422,11 +468,15 @@ export default function AutoTraderPro(){
         // New trade
         const alreadyIn=s.open.some(t=>t.sym===sym&&t.dir===sig.dir&&!t.isPyramid);
         if(alreadyIn||!canOpen){s.signals=[{...sig,id:Date.now()+s.n+sym,sym,traded:false,fr:alreadyIn?"Already in position":"Risk limit",time:new Date().toLocaleTimeString()},...s.signals].slice(0,100);continue;}
-        const sh=sizePos(s.capital,px,r),cost=sh*px;
+        const isLev=LEVERAGED_SYMS.has(sym);
+        const sh=sizePos(s.capital,px,r,isLev?LEV_SIZE_MULT:1);
+        const cost=sh*px;
         if(sh<=0||cost>s.capital){s.signals=[{...sig,id:Date.now()+s.n+sym,sym,traded:false,fr:"Insufficient Capital",time:new Date().toLocaleTimeString()},...s.signals].slice(0,100);continue;}
-        const sl=sig.dir==="BUY"?+(px*(1-r.slPct/100)).toFixed(3):+(px*(1+r.slPct/100)).toFixed(3),tp=sig.dir==="BUY"?+(px*(1+r.slPct/100*r.tpRatio)).toFixed(3):+(px*(1-r.slPct/100*r.tpRatio)).toFixed(3);
+        const slPct=r.slPct*(isLev?LEV_SL_MULT:1);
+        const sl=sig.dir==="BUY"?+(px*(1-slPct/100)).toFixed(3):+(px*(1+slPct/100)).toFixed(3);
+        const tp=sig.dir==="BUY"?+(px*(1+slPct/100*r.tpRatio)).toFixed(3):+(px*(1-slPct/100*r.tpRatio)).toFixed(3);
         s.capital-=cost;
-        s.open=[...s.open,{id:Date.now()+s.n+sym,sym,dir:sig.dir,entry:+px.toFixed(3),shares:sh,cost:+cost.toFixed(2),sl,tp,why:sig.reasons.slice(0,2).join(" + "),ot:new Date().toLocaleTimeString(),str:sig.label}];
+        s.open=[...s.open,{id:Date.now()+s.n+sym,sym,dir:sig.dir,entry:+px.toFixed(3),shares:sh,cost:+cost.toFixed(2),sl,tp,why:sig.reasons.slice(0,2).join(" + "),ot:new Date().toLocaleTimeString(),str:sig.label,isLeveraged:isLev}];
         s.signals=[{...sig,id:Date.now()+s.n+sym,sym,traded:true,fr:null,time:new Date().toLocaleTimeString()},...s.signals].slice(0,100);
       }
 
@@ -439,7 +489,11 @@ export default function AutoTraderPro(){
   },[]);
 
   const activeTick=dataMode==="live"?LIVE_TICK:SIM_TICK;
-  useEffect(()=>{if(!running)return;const id=setInterval(()=>doTick(),activeTick);return()=>clearInterval(id);},[running,doTick,activeTick]);
+  useEffect(()=>{
+    if(!running||reconnecting)return;
+    const id=setInterval(()=>doTick(),activeTick);
+    return()=>clearInterval(id);
+  },[running,reconnecting,doTick,activeTick]);
 
   const reset=()=>{ts.current={symbols:initSymbols(),watchlist:[...DEFAULT_WATCHLIST],capital:INIT_CAP,open:[],closed:[],signals:[],dailyPnL:0,portHist:[{v:INIT_CAP}],n:0};setScannerSigs({});setRunning(false);try{localStorage.removeItem(STORAGE_KEY);}catch{};bump(n=>n+1);};
   const toggleWL=sym=>{const s=ts.current,idx=s.watchlist.indexOf(sym);if(idx>=0){if(s.watchlist.length<=1)return;s.watchlist=s.watchlist.filter(x=>x!==sym);}else s.watchlist=[...s.watchlist,sym];bump(n=>n+1);};
@@ -472,7 +526,7 @@ export default function AutoTraderPro(){
     const closed=s.closed;
     if(!closed.length)return null;
     // Per-symbol stats
-    const bySymbol={};
+    const bySymbol:{[k:string]:{sym:string,trades:number,wins:number,losses:number,pnl:number}}={};
     for(const t of closed){
       if(!bySymbol[t.sym])bySymbol[t.sym]={sym:t.sym,trades:0,wins:0,losses:0,pnl:0};
       bySymbol[t.sym].trades++;bySymbol[t.sym].pnl+=t.pnl;
@@ -551,16 +605,31 @@ export default function AutoTraderPro(){
             )}
           </div>
           <button onClick={reset} style={{background:T.card,color:T.muted,border:`1px solid ${T.border}`,padding:"5px 10px",borderRadius:6,fontSize:12,cursor:"pointer"}}>↺ Reset</button>
-          <button onClick={()=>setRunning(r=>!r)}
-            style={{background:running?"linear-gradient(135deg,#7f1d1d,#ef4444)":"linear-gradient(135deg,#065f46,#00d4aa)",color:"white",border:"none",padding:"6px 16px",borderRadius:6,fontWeight:800,fontSize:12,cursor:"pointer",boxShadow:`0 0 16px ${running?"#ef444440":"#00d4aa35"}`}}>
-            {running?"⏹ Stop Bot":"▶ Start Bot"}
+          <button onClick={()=>setRunning(r=>!r)} disabled={reconnecting||liveBlocked}
+            style={{background:reconnecting||liveBlocked?"#1f2937":running?"linear-gradient(135deg,#7f1d1d,#ef4444)":"linear-gradient(135deg,#065f46,#00d4aa)",color:reconnecting||liveBlocked?T.muted:"white",border:"none",padding:"6px 16px",borderRadius:6,fontWeight:800,fontSize:12,cursor:reconnecting||liveBlocked?"not-allowed":"pointer",boxShadow:reconnecting||liveBlocked?"none":`0 0 16px ${running?"#ef444440":"#00d4aa35"}`}}>
+            {reconnecting?"⏳ Reconnecting...":liveBlocked?"🚫 No Live Data":running?"⏹ Stop Bot":"▶ Start Bot"}
           </button>
         </div>
       </div>
 
-      {restored && (
+      {restored && !reconnecting && !liveBlocked && (
         <div style={{background:T.G+"15",borderBottom:`1px solid ${T.G}33`,padding:"6px 16px",fontSize:11,color:T.G,textAlign:"center"}}>
-          ✓ Restored your previous session — capital, open trades, and history loaded from this device
+          ✓ Restored previous session — capital, trades and history loaded from this device
+        </div>
+      )}
+
+      {reconnecting && (
+        <div style={{background:T.Y+"15",borderBottom:`1px solid ${T.Y}33`,padding:"8px 16px",fontSize:11,color:T.Y,textAlign:"center",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+          <span style={{display:"inline-block",width:10,height:10,borderRadius:"50%",border:`2px solid ${T.Y}`,borderTopColor:"transparent",animation:"spin 0.8s linear infinite"}}/>
+          Reconnecting to live market data — ticking paused until real bars are confirmed...
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+        </div>
+      )}
+
+      {liveBlocked && !reconnecting && (
+        <div style={{background:T.R+"15",borderBottom:`1px solid ${T.R}44`,padding:"8px 16px",fontSize:11,color:T.R,display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:8}}>
+          <span>🚫 <b>Live Data Only mode</b> — connection lost. Bot is frozen. No sim data will run.</span>
+          <button onClick={()=>connectLive()} style={{background:T.R+"22",color:T.R,border:`1px solid ${T.R}55`,padding:"4px 12px",borderRadius:6,fontSize:11,cursor:"pointer",fontWeight:700}}>↺ Retry Connection</button>
         </div>
       )}
 
@@ -605,7 +674,7 @@ export default function AutoTraderPro(){
         {tab==="scanner"&&(
           <div>
             <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
-              <div style={{fontSize:12,color:T.muted}}>Click any card to open its chart · {connected?"🟢 Live Alpaca data":"⚪ Simulated prices"}</div>
+              <div style={{fontSize:12,color:T.muted}}>Click any card to open its chart · {connected?"🟢 Live Twelve Data":"⚪ Simulated prices"}</div>
               <div style={{display:"flex",gap:10,fontSize:11}}>
                 <span style={{color:T.G}}>▲ {Object.values(scannerSigs).filter(s=>s.dir==="BUY").length} bullish</span>
                 <span style={{color:T.R}}>▼ {Object.values(scannerSigs).filter(s=>s.dir==="SELL").length} bearish</span>
@@ -625,6 +694,7 @@ export default function AutoTraderPro(){
                       <div style={{display:"flex",flexDirection:"column",alignItems:"flex-end",gap:3}}>
                         {openTrade&&<span style={{fontSize:9,background:T.B+"22",color:T.B,border:`1px solid ${T.B}44`,padding:"1px 5px",borderRadius:3,fontWeight:800}}>IN</span>}
                         {hasPyramid&&<span style={{fontSize:9,background:T.O+"22",color:T.O,border:`1px solid ${T.O}44`,padding:"1px 5px",borderRadius:3,fontWeight:800}}>+PY</span>}
+                        {LEVERAGED_SYMS.has(sym)&&<span style={{fontSize:9,background:T.R+"22",color:T.R,border:`1px solid ${T.R}44`,padding:"1px 5px",borderRadius:3,fontWeight:800}}>3×</span>}
                       </div>
                     </div>
                     <div style={{fontFamily:"monospace",fontWeight:700,fontSize:16,marginBottom:2}}>${px.toFixed(2)}</div>
@@ -639,7 +709,7 @@ export default function AutoTraderPro(){
                 <Lbl>Open Positions</Lbl>
                 {s.open.map(t=>{const px=allPxMap[t.sym]||t.entry,upnl=(t.dir==="BUY"?1:-1)*(px-t.entry)*t.shares;return(
                   <div key={t.id} style={{display:"flex",justifyContent:"space-between",alignItems:"center",background:T.surface,borderRadius:8,padding:"8px 12px",marginBottom:6,border:`1px solid ${(t.dir==="BUY"?T.G:T.R)+"33"}`}}>
-                    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}><DirChip dir={t.dir}/><b>{t.sym}</b><span style={{fontSize:11,color:T.muted}}>{t.shares}sh@${t.entry}</span>{t.trailingActive&&<span style={{background:T.G+"18",color:T.G,border:`1px solid ${T.G}55`,fontSize:9,fontWeight:800,padding:"1px 5px",borderRadius:3}}>🔒</span>}{t.isPyramid&&<span style={{background:T.O+"18",color:T.O,border:`1px solid ${T.O}55`,fontSize:9,fontWeight:800,padding:"1px 5px",borderRadius:3}}>🔺</span>}{t.partialDone&&<span style={{background:T.Y+"18",color:T.Y,border:`1px solid ${T.Y}55`,fontSize:9,fontWeight:800,padding:"1px 5px",borderRadius:3}}>50%✓</span>}</div>
+                    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}><DirChip dir={t.dir}/><b>{t.sym}</b><span style={{fontSize:11,color:T.muted}}>{t.shares}sh@${t.entry}</span>{t.trailingActive&&<span style={{background:T.G+"18",color:T.G,border:`1px solid ${T.G}55`,fontSize:9,fontWeight:800,padding:"1px 5px",borderRadius:3}}>🔒</span>}{t.isPyramid&&<span style={{background:T.O+"18",color:T.O,border:`1px solid ${T.O}55`,fontSize:9,fontWeight:800,padding:"1px 5px",borderRadius:3}}>🔺</span>}{t.partialDone&&<span style={{background:T.Y+"18",color:T.Y,border:`1px solid ${T.Y}55`,fontSize:9,fontWeight:800,padding:"1px 5px",borderRadius:3}}>50%✓</span>}{(t.isLeveraged||LEVERAGED_SYMS.has(t.sym))&&<span style={{background:T.R+"18",color:T.R,border:`1px solid ${T.R}55`,fontSize:9,fontWeight:800,padding:"1px 5px",borderRadius:3}}>3×LEV</span>}</div>
                     <div style={{textAlign:"right"}}><div style={{fontWeight:700,fontFamily:"monospace",color:sgn(upnl)}}>{upnl>=0?"+":"-"}${Math.abs(upnl).toFixed(2)}</div><div style={{fontSize:10,color:T.muted}}>SL ${t.sl}</div></div>
                   </div>
                 );})}
@@ -946,6 +1016,23 @@ export default function AutoTraderPro(){
               ):(
                 <div style={{background:T.surface,borderRadius:8,padding:"10px 12px",fontSize:12,color:T.G,border:`1px solid ${T.G}33`,textAlign:"center"}}>
                   ✓ Connected · {tf} bars · {s.watchlist.length} symbols loaded · refreshes every 5 min
+                </div>
+              )}
+            </Card>
+
+            <Card glow={liveOnlyMode?T.R:null}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:12}}>
+                <div>
+                  <div style={{fontWeight:700,fontSize:14,marginBottom:4}}>🚫 Live Data Only Mode</div>
+                  <div style={{fontSize:11,color:T.muted,lineHeight:1.6}}>
+                    When enabled, the bot will <b style={{color:T.text}}>never fall back to simulated data</b> if the live connection drops. Instead it freezes completely — no fake candles, no skewed results. Your paper trading data stays clean. <b style={{color:T.R}}>Recommended: always leave this on.</b>
+                  </div>
+                </div>
+                <Toggle on={liveOnlyMode} onChange={v=>setLiveOnlyMode(v)}/>
+              </div>
+              {!liveOnlyMode&&(
+                <div style={{marginTop:10,background:"#1f0a0a",border:`1px solid ${T.R}33`,borderRadius:7,padding:"8px 12px",fontSize:11,color:T.R}}>
+                  ⚠ Sim fallback is <b>ON</b> — if live connection drops, mock data will activate and skew your results.
                 </div>
               )}
             </Card>
